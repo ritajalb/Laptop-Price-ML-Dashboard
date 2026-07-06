@@ -332,10 +332,22 @@ def train_models(X: pd.DataFrame, y: pd.Series):
                 "R2": r2_score(y_true, y_pred)}
 
     importances = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
-    return {"rf": rf, "y_test": y_test, "pred_lr": pred_lr, "pred_rf": pred_rf,
+    return {"rf": rf, "lr": lr, "scaler": scaler, "pca": pca, "binary_cols": binary_cols,
+            "y_test": y_test, "pred_lr": pred_lr, "pred_rf": pred_rf,
             "m_lr": metrics(y_test, pred_lr), "m_rf": metrics(y_test, pred_rf),
             "pca_var": pca.explained_variance_ratio_, "n_components": pca.n_components_,
             "importances": importances, "feature_cols": list(X.columns)}
+
+
+def predict_price(X_row: pd.DataFrame, model_name: str, results: dict) -> np.ndarray:
+    """Predict with the chosen model, applying the exact same transforms used in training."""
+    if model_name == "Random Forest":
+        return results["rf"].predict(X_row)
+    # Linear Regression + PCA: scale continuous -> PCA -> hstack binaries
+    X_cont = results["scaler"].transform(X_row[CONTINUOUS_COLS])
+    X_pca = results["pca"].transform(X_cont)
+    X_final = np.hstack([X_pca, X_row[results["binary_cols"]].values])
+    return np.maximum(results["lr"].predict(X_final), 0)
 
 
 # ------------------------------------------------------------
@@ -660,8 +672,14 @@ def page_predictor(clean, results, fmt):
     hero("Price Predictor",
          "Build a laptop spec-by-spec — the trained Random Forest (300 trees) prices it instantly.")
 
-    rf, cols = results["rf"], results["feature_cols"]
+    cols = results["feature_cols"]
     rate, sym = fmt["rate"], fmt["sym"]
+
+    model_name = st.radio("Prediction model", ["Random Forest", "Linear Regression + PCA"],
+                          horizontal=True)
+    m = results["m_rf"] if model_name == "Random Forest" else results["m_lr"]
+    st.caption(f"{model_name} on the test set:  R² = {m['R2']:.3f}  ·  "
+               f"typical error (MAE) ≈ {m['MAE']*rate:,.0f} {sym}")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -701,14 +719,18 @@ def page_predictor(clean, results, fmt):
             f"GPU_Brand_{gpu_brand}": 1, opsys: 1,
             f"Company_{company}": 1, f"TypeName_{typename}": 1}
     X_row = pd.DataFrame([spec]).reindex(columns=cols, fill_value=0)
-    price_inr = float(rf.predict(X_row)[0])
+    price_inr = float(predict_price(X_row, model_name, results)[0])
     price = price_inr * rate
+    other_name = "Linear Regression + PCA" if model_name == "Random Forest" else "Random Forest"
+    other_price = float(predict_price(X_row, other_name, results)[0]) * rate
 
     st.markdown("---")
     left, right = st.columns([1, 1.2])
     with left:
         animated_price(price, sym)
-        st.caption("Dataset prices are in Indian Rupees (INR) — conversion rates are approximate.")
+        st.caption(f"Dataset prices are in Indian Rupees (INR) — conversion rates are approximate.  \n"
+                   f"For the same build, {other_name} predicts **{other_price:,.0f} {sym}** "
+                   f"({(price - other_price):+,.0f} {sym} difference).")
         max_p = float(clean["Price"].max()) * rate
         q1, q2 = clean["Price"].quantile(0.33) * rate, clean["Price"].quantile(0.66) * rate
         fig = go.Figure(go.Indicator(
@@ -733,13 +755,17 @@ def page_predictor(clean, results, fmt):
             s["Ram"] = r
             rows.append(s)
         X_sens = pd.DataFrame(rows).reindex(columns=cols, fill_value=0)
-        sens_pred = rf.predict(X_sens) * rate
+        sens_pred = predict_price(X_sens, model_name, results) * rate
+        sens_other = predict_price(X_sens, other_name, results) * rate
         fig = go.Figure()
+        fig.add_trace(go.Scatter(x=ram_options, y=sens_other, mode="lines",
+                                 line=dict(color=MUTED, width=2, dash="dot", shape="spline"),
+                                 name=other_name, opacity=0.7))
         fig.add_trace(go.Scatter(x=ram_options, y=sens_pred, mode="lines+markers",
-                                 line=dict(color=CYAN, width=3, shape="spline"), name="Predicted price"))
+                                 line=dict(color=CYAN, width=3, shape="spline"), name=model_name))
         fig.add_trace(go.Scatter(x=[ram], y=[price], mode="markers",
                                  marker=dict(color=ORANGE, size=16, symbol="star"), name="Your build"))
-        fig.update_layout(title="Same build, different RAM — the non-linear jumps the Random Forest learned",
+        fig.update_layout(title="Same build, different RAM — solid line is your chosen model",
                           xaxis_title="RAM (GB)", yaxis_title=f"Predicted price ({sym})", height=330)
         fig_show(fig)
 
